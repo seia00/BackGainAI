@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BackGainAI — Posture Monitor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      background: #030712;
+      color: white;
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Display', 'Segoe UI', system-ui, sans-serif;
+      overflow-x: hidden;
+    }
+
+    /* Dot grid texture */
+    .dot-grid {
+      background-image: radial-gradient(rgba(255,255,255,0.055) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+
+    /* Frosted glass card */
+    .glass {
+      background: rgba(255,255,255,0.03);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid rgba(255,255,255,0.07);
+    }
+
+    /* Gradient text */
+    .gradient-text {
+      background: linear-gradient(160deg, #ffffff 30%, rgba(255,255,255,0.55) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    /* CTA button */
+    .glow-btn {
+      background: linear-gradient(135deg, #22c55e, #16a34a);
+      box-shadow: 0 0 30px rgba(34,197,94,0.4), 0 4px 20px rgba(0,0,0,0.3);
+      transition: all 0.22s ease;
+    }
+    .glow-btn:hover {
+      box-shadow: 0 0 55px rgba(34,197,94,0.65), 0 6px 28px rgba(0,0,0,0.4);
+      transform: translateY(-1px);
+    }
+
+    /* Animations */
+    @keyframes fadeUp   { from { opacity: 0; transform: translateY(22px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes orbFloat { 0%,100% { transform: scale(1) translate(0,0); } 40% { transform: scale(1.06) translate(18px,-14px); } 75% { transform: scale(0.96) translate(-12px, 9px); } }
+    @keyframes camPulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:0.35; transform:scale(1.7); } }
+    @keyframes notifIn  { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes notifOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(120%); opacity: 0; } }
+    @keyframes spin     { to { transform: rotate(360deg); } }
+    @keyframes spinSlow { to { transform: rotate(360deg); } }
+    @keyframes pulse    { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    @keyframes ringPulse{ 0%,100% { opacity: 0.4; transform: scale(1); } 50% { opacity: 0.15; transform: scale(1.04); } }
+
+    .fade-up { animation: fadeUp 0.65s ease both; }
+    .notif-enter { animation: notifIn  0.44s cubic-bezier(0.34, 1.4, 0.64, 1) forwards; }
+    .notif-exit  { animation: notifOut 0.28s ease-in forwards; }
+    .score-num { font-variant-numeric: tabular-nums; }
+    .stat-card { transition: background 0.2s, border-color 0.2s; }
+    .stat-card:hover { background: rgba(255,255,255,0.05) !important; border-color: rgba(255,255,255,0.11) !important; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── MediaPipe landmark indices ─────────────────────────────────────
+const LM = {
+  NOSE: 0, L_EAR: 7, R_EAR: 8,
+  L_SHOULDER: 11, R_SHOULDER: 12,
+  L_ELBOW: 13,    R_ELBOW: 14,
+  L_WRIST: 15,    R_WRIST: 16,
+  L_HIP: 23,      R_HIP: 24,
+};
+
+// ── Helpers ───────────────────────────────────────────────────────
+function getStateFromScore(s) {
+  if (s >= 75) return 'good';
+  if (s >= 50) return 'drifting';
+  return 'slouching';
+}
+function stateColor(st) {
+  return { good: '#22c55e', drifting: '#f59e0b', slouching: '#ef4444' }[st] ?? '#22c55e';
+}
+function stateRgb(st) {
+  return { good: '34,197,94', drifting: '245,158,11', slouching: '239,68,68' }[st] ?? '34,197,94';
+}
+function stateLabel(st) {
+  return { good: 'Good Posture', drifting: 'Drifting', slouching: 'Slouching' }[st] ?? 'Good';
+}
+
+function computePostureScore(lm, baseline) {
+  const nose = lm[LM.NOSE], ls = lm[LM.L_SHOULDER], rs = lm[LM.R_SHOULDER];
+  if (!nose || !ls || !rs) return 100;
+  const avgShoulderY        = (ls.y + rs.y) / 2;
+  const shoulderLevelness   = Math.abs(ls.y - rs.y);
+  const noseToShoulderRatio = avgShoulderY - nose.y;
+  const levelnessDev = Math.abs(shoulderLevelness - baseline.shoulderLevelness);
+  const ratioDev     = baseline.noseToShoulderRatio - noseToShoulderRatio;
+  const heightDev    = Math.max(0, avgShoulderY - baseline.avgShoulderY);
+  let score = 100;
+  score -= levelnessDev * 420;
+  score -= Math.max(0, ratioDev) * 260;
+  score -= heightDev * 580;
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+// ── Enhanced Skeleton Renderer ────────────────────────────────────
+function drawSkeleton(canvas, lm, postureState) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (!lm || lm.length === 0) {
+    ctx.fillStyle = 'rgba(255,255,255,0.13)';
+    ctx.font = '13px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Waiting for detection…', W / 2, H / 2);
+    return;
+  }
+
+  const col = stateColor(postureState);
+  const rgb = stateRgb(postureState);
+
+  const get = (id) => {
+    const p = lm[id];
+    if (!p || p.visibility < 0.38) return null;
+    return { x: p.x * W, y: p.y * H, vis: p.visibility };
+  };
+
+  const nose = get(LM.NOSE);
+  const lear = get(LM.L_EAR);
+  const rear = get(LM.R_EAR);
+  const ls   = get(LM.L_SHOULDER);
+  const rs   = get(LM.R_SHOULDER);
+  const le   = get(LM.L_ELBOW);
+  const re   = get(LM.R_ELBOW);
+  const lw   = get(LM.L_WRIST);
+  const rw   = get(LM.R_WRIST);
+  const lh   = get(LM.L_HIP);
+  const rh   = get(LM.R_HIP);
+
+  const smid = ls && rs ? { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 } : null;
+  const hmid = lh && rh ? { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2 } : null;
+  const emid = lear && rear ? { x: (lear.x + rear.x) / 2, y: (lear.y + rear.y) / 2 } : null;
+
+  // Tapered bone helper
+  const drawBone = (p1, p2, w1, w2 = w1 * 0.65, alpha = 1) => {
+    if (!p1 || !p2) return;
+    const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+    const perp  = angle + Math.PI / 2;
+    ctx.beginPath();
+    ctx.moveTo(p1.x + Math.cos(perp) * w1, p1.y + Math.sin(perp) * w1);
+    ctx.lineTo(p2.x + Math.cos(perp) * w2, p2.y + Math.sin(perp) * w2);
+    ctx.lineTo(p2.x - Math.cos(perp) * w2, p2.y - Math.sin(perp) * w2);
+    ctx.lineTo(p1.x - Math.cos(perp) * w1, p1.y - Math.sin(perp) * w1);
+    ctx.closePath();
+    const grd = ctx.createLinearGradient(p1.x, p1.y, p2.x, p2.y);
+    grd.addColorStop(0, `rgba(${rgb},${alpha})`);
+    grd.addColorStop(1, `rgba(${rgb},${alpha * 0.55})`);
+    ctx.fillStyle = grd;
+    ctx.fill();
+  };
+
+  const drawJoint = (p, r, glow = true) => {
+    if (!p) return;
+    if (glow) {
+      const grd = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 3.5);
+      grd.addColorStop(0, `rgba(${rgb},0.38)`);
+      grd.addColorStop(1, `rgba(${rgb},0)`);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = grd;
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = col;
+    ctx.fill();
+    if (r > 4) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 0.4, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.fill();
+    }
+  };
+
+  // 1. Torso fill with bezier waist curve
+  if (ls && rs && lh && rh) {
+    const wL = { x: ls.x + (lh.x - ls.x) * 0.45 + (rs.x - ls.x) * 0.06, y: (ls.y + lh.y) / 2 };
+    const wR = { x: rs.x + (rh.x - rs.x) * 0.45 - (rs.x - ls.x) * 0.06, y: (rs.y + rh.y) / 2 };
+    ctx.beginPath();
+    ctx.moveTo(ls.x, ls.y);
+    ctx.lineTo(rs.x, rs.y);
+    ctx.bezierCurveTo(rs.x, rs.y, wR.x, wR.y, rh.x, rh.y);
+    ctx.lineTo(lh.x, lh.y);
+    ctx.bezierCurveTo(lh.x, lh.y, wL.x, wL.y, ls.x, ls.y);
+    ctx.closePath();
+    ctx.fillStyle   = `rgba(${rgb},0.07)`;
+    ctx.fill();
+    ctx.strokeStyle = `rgba(${rgb},0.22)`;
+    ctx.lineWidth   = 1.2;
+    ctx.stroke();
+  }
+
+  // 2. Bones
+  if (smid && hmid) drawBone(smid, hmid, 3.5, 2.5, 0.42); // spine
+  drawBone(ls, rs, 4.5, 4.5, 0.78);     // clavicles
+  drawBone(ls, le, 6, 4.5, 0.82);       // L upper arm
+  drawBone(rs, re, 6, 4.5, 0.82);       // R upper arm
+  drawBone(le, lw, 4.5, 3, 0.68);       // L forearm
+  drawBone(re, rw, 4.5, 3, 0.68);       // R forearm
+  drawBone(lh, rh, 4.5, 4.5, 0.72);    // pelvis
+  if (smid && emid) drawBone(smid, emid, 5, 3.5, 0.72); // neck via ears
+  else if (smid && nose) {
+    const nt = { x: nose.x, y: nose.y + (smid.y - nose.y) * 0.38 };
+    drawBone(smid, nt, 5, 3, 0.68);
+  }
+
+  // 3. Joints
+  drawJoint(ls, 7.5);  drawJoint(rs, 7.5);
+  drawJoint(le, 5.5);  drawJoint(re, 5.5);
+  drawJoint(lw, 4);    drawJoint(rw, 4);
+  drawJoint(lh, 6.5);  drawJoint(rh, 6.5);
+
+  // 4. Head — oval with glow halo
+  if (nose) {
+    let hcx = nose.x, hcy = nose.y;
+    if (lear && rear) { hcx = (lear.x + rear.x) / 2; hcy = (lear.y + rear.y) / 2 - 3; }
+    const hr = W * 0.092;
+    // Halo
+    const hGrd = ctx.createRadialGradient(hcx, hcy, 0, hcx, hcy, hr * 2.6);
+    hGrd.addColorStop(0, `rgba(${rgb},0.2)`);
+    hGrd.addColorStop(1, `rgba(${rgb},0)`);
+    ctx.beginPath();
+    ctx.arc(hcx, hcy, hr * 2.6, 0, Math.PI * 2);
+    ctx.fillStyle = hGrd;
+    ctx.fill();
+    // Head oval
+    ctx.beginPath();
+    ctx.ellipse(hcx, hcy, hr * 0.76, hr, 0, 0, Math.PI * 2);
+    ctx.fillStyle   = `rgba(${rgb},0.06)`;
+    ctx.fill();
+    ctx.strokeStyle = `rgba(${rgb},0.78)`;
+    ctx.lineWidth   = 2.5;
+    ctx.stroke();
+    // Nose dot
+    ctx.beginPath();
+    ctx.arc(nose.x, nose.y, 3.8, 0, Math.PI * 2);
+    ctx.fillStyle = col;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(nose.x, nose.y, 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fill();
+  }
+}
+
+// ── Sparkline (SVG) ────────────────────────────────────────────────
+function SparklineChart({ data, height = 60 }) {
+  if (!data || data.length < 2) {
+    return (
+      <div style={{ height: `${height}px`, display:'flex', alignItems:'center', justifyContent:'center' }}>
+        <span style={{ fontSize:'11px', color:'rgba(255,255,255,0.2)' }}>Collecting data…</span>
+      </div>
+    );
+  }
+  const W = 860, H = height;
+  const pts = data.map((d, i) => [
+    (i / (data.length - 1)) * W,
+    H - (d.score / 100) * (H - 10) - 5,
+  ]);
+  const polyPts = pts.map(p => p.join(',')).join(' ');
+  const lastSt  = getStateFromScore(data[data.length - 1].score);
+  const col     = stateColor(lastSt);
+  const areaD   = `M0,${H} L${pts[0][0]},${pts[0][1]} ${pts.map(p=>`L${p[0]},${p[1]}`).join(' ')} L${pts[pts.length-1][0]},${H} Z`;
+  return (
+    <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{display:'block'}}>
+      <defs>
+        <linearGradient id="spkG" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%"   stopColor={col} stopOpacity="0.32"/>
+          <stop offset="100%" stopColor={col} stopOpacity="0"/>
+        </linearGradient>
+      </defs>
+      <line x1="0" y1={H-0.75*(H-10)-5} x2={W} y2={H-0.75*(H-10)-5} stroke="rgba(34,197,94,0.16)"  strokeWidth="1" strokeDasharray="4,3"/>
+      <line x1="0" y1={H-0.50*(H-10)-5} x2={W} y2={H-0.50*(H-10)-5} stroke="rgba(239,68,68,0.16)"  strokeWidth="1" strokeDasharray="4,3"/>
+      <path d={areaD} fill="url(#spkG)"/>
+      <polyline points={polyPts} fill="none" stroke={col} strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round"/>
+      <circle cx={pts[pts.length-1][0]} cy={pts[pts.length-1][1]} r="4" fill={col}/>
+    </svg>
+  );
+}
+
+// ── Landing Page ───────────────────────────────────────────────────
+function LandingPage({ onContinue, mpReady }) {
+  return (
+    <div style={{ minHeight:'100vh', background:'#030712', position:'relative', overflow:'hidden', display:'flex', flexDirection:'column' }}>
+      {/* Ambient orbs */}
+      <div style={{ position:'absolute', inset:0, pointerEvents:'none', overflow:'hidden' }}>
+        <div style={{
+          position:'absolute', top:'-20%', right:'8%',
+          width:'700px', height:'700px', borderRadius:'50%',
+          background:'radial-gradient(circle, rgba(34,197,94,0.11) 0%, transparent 68%)',
+          filter:'blur(50px)', animation:'orbFloat 10s ease-in-out infinite',
+        }}/>
+        <div style={{
+          position:'absolute', bottom:'-15%', left:'-8%',
+          width:'550px', height:'550px', borderRadius:'50%',
+          background:'radial-gradient(circle, rgba(34,197,94,0.055) 0%, transparent 70%)',
+          filter:'blur(60px)', animation:'orbFloat 14s ease-in-out infinite reverse',
+        }}/>
+        <div style={{
+          position:'absolute', top:'45%', left:'30%',
+          width:'360px', height:'360px', borderRadius:'50%',
+          background:'radial-gradient(circle, rgba(255,255,255,0.018) 0%, transparent 70%)',
+          filter:'blur(35px)',
+        }}/>
+      </div>
+      <div className="dot-grid" style={{ position:'absolute', inset:0, pointerEvents:'none' }}/>
+
+      {/* Nav */}
+      <nav style={{
+        position:'relative', zIndex:10,
+        padding:'22px 48px',
+        display:'flex', alignItems:'center', justifyContent:'space-between',
+        borderBottom:'1px solid rgba(255,255,255,0.04)',
+      }}>
+        <div style={{ display:'flex', alignItems:'center', gap:'10px' }}>
+          <div style={{
+            width:'32px', height:'32px', borderRadius:'8px',
+            background:'linear-gradient(135deg,rgba(34,197,94,0.28),rgba(34,197,94,0.55))',
+            border:'1px solid rgba(34,197,94,0.38)',
+            display:'flex', alignItems:'center', justifyContent:'center', fontSize:'16px',
+          }}>↑</div>
+          <span style={{ fontSize:'16px', fontWeight:'800', letterSpacing:'-0.02em' }}>BackGainAI</span>
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:'8px' }}>
+          {[
+            { label:'100% Client-Side', color:'34,197,94' },
+            { label:'Zero Data Stored', color:'255,255,255' },
+            { label:'Camera Never Recorded', color:'255,255,255' },
+          ].map(({ label, color }, i) => (
+            <div key={i} style={{
+              padding:'5px 13px', borderRadius:'100px', fontSize:'12px',
+              background:`rgba(${color},0.05)`, border:`1px solid rgba(${color},0.1)`,
+              color:`rgba(${color},${i===0?'0.85':'0.38'})`,
+            }}>{label}</div>
+          ))}
+        </div>
+      </nav>
+
+      {/* Hero */}
+      <div style={{
+        flex:1, display:'flex', alignItems:'center', justifyContent:'center',
+        position:'relative', zIndex:10, padding:'60px 48px 40px',
+      }}>
+        <div style={{ maxWidth:'820px', textAlign:'center' }}>
+          {/* Live badge */}
+          <div className="fade-up" style={{
+            animationDelay:'0s', display:'inline-flex', alignItems:'center', gap:'8px',
+            padding:'6px 16px', borderRadius:'100px', marginBottom:'32px',
+            background:'rgba(34,197,94,0.08)', border:'1px solid rgba(34,197,94,0.2)',
+          }}>
+            <div style={{ width:'6px', height:'6px', borderRadius:'50%', background:'#22c55e', animation:'camPulse 2s infinite' }}/>
+            <span style={{ fontSize:'12px', color:'#4ade80', fontWeight:'600', letterSpacing:'0.04em' }}>
+              AI POSTURE MONITORING — LIVE IN BROWSER
+            </span>
+          </div>
+
+          {/* Headline */}
+          <h1 className="fade-up gradient-text" style={{
+            animationDelay:'0.1s',
+            fontSize:'clamp(44px, 7.5vw, 86px)',
+            fontWeight:'800',
+            lineHeight:'1.04',
+            letterSpacing:'-0.045em',
+            marginBottom:'26px',
+          }}>
+            Unleash productivity<br/>with a better posture.
+          </h1>
+
+          {/* Sub */}
+          <p className="fade-up" style={{
+            animationDelay:'0.2s',
+            fontSize:'17px', color:'rgba(255,255,255,0.42)',
+            lineHeight:'1.75', marginBottom:'52px',
+            maxWidth:'500px', margin:'0 auto 52px',
+          }}>
+            Real-time posture detection powered by MediaPipe AI.
+            <br/>Runs entirely on your device — zero data ever leaves your browser.
+          </p>
+
+          {/* CTA row */}
+          <div className="fade-up" style={{
+            animationDelay:'0.3s',
+            display:'flex', gap:'14px', justifyContent:'center', flexWrap:'wrap',
+          }}>
+            <button
+              className="glow-btn"
+              onClick={onContinue}
+              disabled={!mpReady}
+              style={{
+                padding:'16px 38px', borderRadius:'14px',
+                fontSize:'15px', fontWeight:'700',
+                border:'none', color:'white',
+                cursor: mpReady ? 'pointer' : 'not-allowed',
+                opacity: mpReady ? 1 : 0.55,
+                display:'flex', alignItems:'center', gap:'10px',
+              }}
+            >
+              {mpReady
+                ? <><span>Start Monitoring</span><span style={{fontSize:'15px'}}>→</span></>
+                : <><span>Loading AI</span><span style={{animation:'spin 1s linear infinite',display:'inline-block',fontSize:'14px'}}>⟳</span></>
+              }
+            </button>
+            <div style={{
+              padding:'16px 22px', borderRadius:'14px', fontSize:'13px', fontWeight:'500',
+              background:'rgba(255,255,255,0.03)', border:'1px solid rgba(255,255,255,0.07)',
+              color:'rgba(255,255,255,0.35)',
+              display:'flex', alignItems:'center', gap:'8px',
+            }}>
+              🔒 Camera feed never stored or shown
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom trust bar */}
+      <div style={{
+        position:'relative', zIndex:10,
+        borderTop:'1px solid rgba(255,255,255,0.04)',
+        padding:'22px 48px',
+        display:'flex', alignItems:'center', justifyContent:'center', gap:'44px', flexWrap:'wrap',
+      }}>
+        {[
+          { icon:'🧠', label:'MediaPipe Neural AI' },
+          { icon:'⚡', label:'Real-time Detection' },
+          { icon:'🔒', label:'Zero Data Collection' },
+          { icon:'🔔', label:'Push Notifications' },
+          { icon:'🎯', label:'Personal Calibration' },
+          { icon:'🖥️', label:'Works While Browsing' },
+        ].map(({ icon, label }) => (
+          <div key={label} style={{ display:'flex', alignItems:'center', gap:'8px', fontSize:'12px', color:'rgba(255,255,255,0.28)' }}>
+            <span>{icon}</span><span>{label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Disclaimer Page ────────────────────────────────────────────────
+function DisclaimerPage({ onContinue }) {
+  const items = [
+    {
+      icon: '🔒',
+      title: 'Zero Data Storage',
+      body: "None of your data is stored anywhere — not locally, not remotely. All posture analysis runs in your browser's memory and is permanently erased the moment you close the tab.",
+      col: '34,197,94',
+    },
+    {
+      icon: '📷',
+      title: 'Your Camera Is Never Recorded',
+      body: 'We never render, save, or transmit your camera image. MediaPipe extracts only invisible skeletal coordinates in real-time. Your face and body are never visible anywhere in this app.',
+      col: '139,92,246',
+    },
+    {
+      icon: '🛡️',
+      title: 'Fully On-Device AI',
+      body: 'All processing happens locally using MediaPipe Pose. No data, no frames, no analytics are ever sent to any server. This app functions entirely offline once the AI model loads.',
+      col: '245,158,11',
+    },
+  ];
+
+  return (
+    <div style={{
+      minHeight:'100vh', background:'#030712', position:'relative', overflow:'hidden',
+      display:'flex', alignItems:'center', justifyContent:'center', padding:'40px 24px',
+    }}>
+      <div style={{
+        position:'absolute', top:'15%', left:'50%', transform:'translateX(-50%)',
+        width:'700px', height:'400px', borderRadius:'50%',
+        background:'radial-gradient(ellipse, rgba(34,197,94,0.05) 0%, transparent 70%)',
+        filter:'blur(50px)', pointerEvents:'none',
+      }}/>
+      <div className="dot-grid" style={{ position:'absolute', inset:0, pointerEvents:'none' }}/>
+
+      <div style={{ position:'relative', maxWidth:'640px', width:'100%' }}>
+        <div style={{ textAlign:'center', marginBottom:'40px' }}>
+          <div style={{
+            display:'inline-flex', alignItems:'center', gap:'6px',
+            padding:'5px 14px', borderRadius:'100px', marginBottom:'18px',
+            background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.08)',
+            fontSize:'11px', color:'rgba(255,255,255,0.35)', letterSpacing:'0.06em',
+          }}>STEP 1 OF 2 — PRIVACY & SECURITY</div>
+          <h2 className="gradient-text" style={{
+            fontSize:'36px', fontWeight:'800', letterSpacing:'-0.035em', marginBottom:'10px',
+          }}>Before we begin</h2>
+          <p style={{ fontSize:'15px', color:'rgba(255,255,255,0.38)', lineHeight:1.65 }}>
+            Here's exactly how BackGainAI handles your privacy.
+          </p>
+        </div>
+
+        <div style={{ display:'flex', flexDirection:'column', gap:'12px', marginBottom:'32px' }}>
+          {items.map(({ icon, title, body, col }, i) => (
+            <div key={i} className="fade-up" style={{
+              animationDelay:`${i * 0.09}s`,
+              background:`rgba(${col},0.04)`,
+              border:`1px solid rgba(${col},0.14)`,
+              borderRadius:'18px', padding:'20px 22px',
+              display:'flex', gap:'16px', alignItems:'flex-start',
+            }}>
+              <div style={{
+                width:'42px', height:'42px', borderRadius:'11px', flexShrink:0,
+                background:`rgba(${col},0.1)`, border:`1px solid rgba(${col},0.2)`,
+                display:'flex', alignItems:'center', justifyContent:'center', fontSize:'19px',
+              }}>{icon}</div>
+              <div style={{ flex:1 }}>
+                <div style={{ fontSize:'14px', fontWeight:'700', marginBottom:'5px', color:'rgba(255,255,255,0.9)' }}>{title}</div>
+                <div style={{ fontSize:'13px', color:'rgba(255,255,255,0.43)', lineHeight:1.68 }}>{body}</div>
+              </div>
+              <div style={{
+                flexShrink:0, marginTop:'2px',
+                width:'22px', height:'22px', borderRadius:'50%',
+                background:`rgba(${col},0.14)`, border:`1px solid rgba(${col},0.3)`,
+                display:'flex', alignItems:'center', justifyContent:'center',
+                fontSize:'12px', color:`rgb(${col})`,
+              }}>✓</div>
+            </div>
+          ))}
+        </div>
+
+        <button
+          className="glow-btn"
+          onClick={onContinue}
+          style={{
+            width:'100%', padding:'16px', borderRadius:'14px',
+            fontSize:'15px', fontWeight:'700', border:'none', color:'white', cursor:'pointer',
+          }}
+        >
+          I Understand — Continue to Setup
+        </button>
+        <p style={{ textAlign:'center', marginTop:'16px', fontSize:'12px', color:'rgba(255,255,255,0.18)' }}>
+          By continuing you acknowledge the above privacy terms.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Calibration Modal ──────────────────────────────────────────────
+function CalibrationModal({ phase, countdown, calibSampleCount, permErr, mpReady, onStart, calibCanvasRef }) {
+  return (
+    <div style={{
+      position:'fixed', inset:0, zIndex:3000,
+      background:'rgba(0,0,0,0.88)',
+      backdropFilter:'blur(14px)', WebkitBackdropFilter:'blur(14px)',
+      display:'flex', alignItems:'center', justifyContent:'center', padding:'24px',
+    }}>
+      <div style={{
+        background:'rgba(8,8,18,0.98)',
+        border:'1px solid rgba(255,255,255,0.09)',
+        borderRadius:'26px', padding:'46px 42px',
+        width:'480px', maxWidth:'100%', textAlign:'center',
+        boxShadow:'0 48px 120px rgba(0,0,0,0.75)',
+      }}>
+        {phase === 'init' ? (
+          <>
+            <div style={{
+              width:'64px', height:'64px', margin:'0 auto 22px',
+              background:'linear-gradient(135deg,rgba(34,197,94,0.12),rgba(34,197,94,0.26))',
+              border:'1px solid rgba(34,197,94,0.28)',
+              borderRadius:'18px', display:'flex', alignItems:'center', justifyContent:'center', fontSize:'28px',
+            }}>🎯</div>
+            <h2 style={{ fontSize:'27px', fontWeight:'800', marginBottom:'10px', letterSpacing:'-0.025em' }}>
+              Let's set your baseline
+            </h2>
+            <p style={{ fontSize:'14px', color:'rgba(255,255,255,0.4)', marginBottom:'30px', lineHeight:1.72 }}>
+              Sit up straight, look forward, and keep your shoulders<br/>visible. We'll sample your ideal posture for 5 seconds.
+            </p>
+            <div style={{
+              marginBottom:'26px', padding:'16px 20px',
+              background:'rgba(34,197,94,0.05)', border:'1px solid rgba(34,197,94,0.12)',
+              borderRadius:'14px', textAlign:'left',
+            }}>
+              {[
+                'Sit in your normal working position',
+                'Keep both shoulders clearly in frame',
+                'Look directly at your screen',
+              ].map((t, i, arr) => (
+                <div key={i} style={{
+                  display:'flex', alignItems:'center', gap:'10px', padding:'6px 0',
+                  fontSize:'13px', color:'rgba(255,255,255,0.5)',
+                  borderBottom: i < arr.length-1 ? '1px solid rgba(255,255,255,0.05)' : 'none',
+                }}>
+                  <span style={{ color:'#22c55e', fontSize:'12px', flexShrink:0 }}>✓</span>
+                  {t}
+                </div>
+              ))}
+            </div>
+            {permErr && (
+              <div style={{
+                marginBottom:'18px', padding:'12px 16px',
+                background:'rgba(239,68,68,0.07)', border:'1px solid rgba(239,68,68,0.18)',
+                borderRadius:'12px',
+              }}>
+                <p style={{ fontSize:'12px', color:'#f87171', margin:0 }}>{permErr}</p>
+              </div>
+            )}
+            <button
+              onClick={onStart}
+              disabled={!mpReady}
+              className={mpReady ? 'glow-btn' : ''}
+              style={{
+                width:'100%', padding:'16px', borderRadius:'14px',
+                fontSize:'15px', fontWeight:'700', border:'none', color:'white',
+                cursor: mpReady ? 'pointer' : 'not-allowed',
+                background: mpReady ? undefined : 'rgba(255,255,255,0.08)',
+                opacity: mpReady ? 1 : 0.5,
+              }}
+            >
+              {mpReady ? 'Allow Camera & Begin Calibration' : 'Loading MediaPipe…'}
+            </button>
+          </>
+        ) : (
+          <>
+            {/* Countdown ring */}
+            <div style={{ position:'relative', width:'100px', height:'100px', margin:'0 auto 24px' }}>
+              <svg width="100" height="100" viewBox="0 0 100 100" style={{ transform:'rotate(-90deg)' }}>
+                <circle cx="50" cy="50" r="44" fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="5"/>
+                <circle
+                  cx="50" cy="50" r="44" fill="none" stroke="#22c55e" strokeWidth="5" strokeLinecap="round"
+                  strokeDasharray={`${2*Math.PI*44}`}
+                  strokeDashoffset={`${2*Math.PI*44*(1-countdown/5)}`}
+                  style={{ transition:'stroke-dashoffset 0.95s linear' }}
+                />
+              </svg>
+              <div style={{
+                position:'absolute', inset:0,
+                display:'flex', alignItems:'center', justifyContent:'center',
+              }}>
+                <span style={{ fontSize:'38px', fontWeight:'800', color:'#22c55e', lineHeight:1 }}>{countdown}</span>
+              </div>
+            </div>
+
+            <h2 style={{ fontSize:'23px', fontWeight:'700', marginBottom:'8px' }}>Calibrating Baseline…</h2>
+            <p style={{ fontSize:'13px', color:'rgba(255,255,255,0.38)', marginBottom:'18px', lineHeight:1.68 }}>
+              Sit up straight and look forward. Keep still<br/>while we sample your posture geometry.
+            </p>
+
+            {/* Quality bar */}
+            <div style={{ display:'flex', alignItems:'center', gap:'10px', justifyContent:'center', marginBottom:'16px' }}>
+              <span style={{ fontSize:'10px', color:'rgba(255,255,255,0.28)', letterSpacing:'0.08em' }}>DETECTION QUALITY</span>
+              <div style={{ width:'110px', height:'5px', background:'rgba(255,255,255,0.07)', borderRadius:'3px' }}>
+                <div style={{
+                  height:'100%', borderRadius:'3px',
+                  width:`${Math.min(100,(calibSampleCount/20)*100)}%`,
+                  background: calibSampleCount > 12 ? '#22c55e' : calibSampleCount > 5 ? '#f59e0b' : '#ef4444',
+                  transition:'width 0.3s, background 0.3s',
+                }}/>
+              </div>
+              <span style={{ fontSize:'10px', color:'rgba(255,255,255,0.28)', minWidth:'26px' }}>{calibSampleCount}</span>
+            </div>
+
+            <canvas
+              ref={calibCanvasRef}
+              width={270} height={200}
+              style={{
+                width:'270px', height:'200px', margin:'0 auto', display:'block',
+                background:'#08080f', borderRadius:'16px',
+                border:'1px solid rgba(255,255,255,0.07)',
+              }}
+            />
+            <p style={{ fontSize:'11px', color:'rgba(255,255,255,0.18)', marginTop:'12px' }}>
+              Make sure both shoulders are visible in frame
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Monitoring View ────────────────────────────────────────────────
+function MonitoringView({
+  phase, score, pState, sessionLog, sessionSecs, avgScore, alertCount,
+  camActive, hudCanvasRef, onPause, onResume, onRecalibrate,
+  notifPermission, onRequestNotif,
+}) {
+  const col     = stateColor(pState);
+  const rgb     = stateRgb(pState);
+  const mm      = String(Math.floor(sessionSecs/60)).padStart(2,'0');
+  const ss      = String(sessionSecs%60).padStart(2,'0');
+  const timeStr = `${mm}:${ss}`;
+
+  return (
+    <div style={{ minHeight:'100vh', background:'#030712', position:'relative', overflow:'hidden' }}>
+      <div className="dot-grid" style={{ position:'fixed', inset:0, pointerEvents:'none', opacity:0.45 }}/>
+
+      {/* Ambient glow behind skeleton */}
+      <div style={{
+        position:'fixed', top:'50%', left:'50%', transform:'translate(-50%,-50%)',
+        width:'520px', height:'520px', borderRadius:'50%',
+        background:`radial-gradient(circle, rgba(${rgb},0.06) 0%, transparent 68%)`,
+        filter:'blur(50px)', transition:'background 0.9s ease', pointerEvents:'none', zIndex:0,
+      }}/>
+
+      {/* Top status strip */}
+      <div style={{
+        position:'fixed', top:0, left:0, right:0, zIndex:1000,
+        height:'4px', background:col,
+        transition:'background 0.7s ease',
+        boxShadow:`0 0 18px ${col}aa, 0 0 48px ${col}33`,
+      }}/>
+
+      {/* Header */}
+      <div style={{
+        position:'fixed', top:'4px', left:0, right:0, zIndex:999,
+        padding:'13px 28px',
+        display:'flex', alignItems:'center', justifyContent:'space-between',
+        background:'rgba(3,7,18,0.82)',
+        backdropFilter:'blur(22px)', WebkitBackdropFilter:'blur(22px)',
+        borderBottom:'1px solid rgba(255,255,255,0.04)',
+      }}>
+        {/* Logo */}
+        <div style={{ display:'flex', alignItems:'center', gap:'10px' }}>
+          <div style={{
+            width:'28px', height:'28px', borderRadius:'7px',
+            background:'linear-gradient(135deg,rgba(34,197,94,0.28),rgba(34,197,94,0.55))',
+            border:'1px solid rgba(34,197,94,0.36)',
+            display:'flex', alignItems:'center', justifyContent:'center', fontSize:'13px',
+          }}>↑</div>
+          <span style={{ fontSize:'14px', fontWeight:'800', letterSpacing:'-0.01em' }}>BackGainAI</span>
+          {camActive && (
+            <div style={{ position:'relative', width:'8px', height:'8px' }}>
+              <div style={{ width:'8px', height:'8px', borderRadius:'50%', background:'#22c55e', position:'absolute' }}/>
+              <div style={{ width:'8px', height:'8px', borderRadius:'50%', background:'#22c55e', position:'absolute', top:0, animation:'camPulse 2s infinite', opacity:0.5 }}/>
+            </div>
+          )}
+        </div>
+
+        {/* Center status badge */}
+        <div style={{
+          padding:'5px 16px', borderRadius:'100px',
+          background:`rgba(${rgb},0.1)`, border:`1px solid rgba(${rgb},0.26)`,
+          fontSize:'12px', fontWeight:'700', color:col,
+          letterSpacing:'0.04em', transition:'all 0.5s',
+        }}>{stateLabel(pState)}</div>
+
+        {/* Actions */}
+        <div style={{ display:'flex', gap:'8px', alignItems:'center' }}>
+          {notifPermission !== 'granted' && (
+            <button onClick={onRequestNotif} style={{
+              padding:'5px 12px', borderRadius:'8px', fontSize:'12px', cursor:'pointer',
+              background:'rgba(245,158,11,0.08)', border:'1px solid rgba(245,158,11,0.2)',
+              color:'#fbbf24', transition:'background 0.2s',
+            }}>🔔 Enable Alerts</button>
+          )}
+          <button onClick={onRecalibrate} style={{
+            padding:'5px 12px', borderRadius:'8px', fontSize:'12px', cursor:'pointer',
+            background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.08)',
+            color:'rgba(255,255,255,0.48)',
+          }}>Recalibrate</button>
+          {phase === 'monitoring' ? (
+            <button onClick={onPause} style={{
+              padding:'5px 12px', borderRadius:'8px', fontSize:'12px', cursor:'pointer',
+              background:'rgba(239,68,68,0.08)', border:'1px solid rgba(239,68,68,0.2)', color:'#f87171',
+            }}>Pause</button>
+          ) : (
+            <button onClick={onResume} style={{
+              padding:'5px 12px', borderRadius:'8px', fontSize:'12px', cursor:'pointer',
+              background:'rgba(34,197,94,0.08)', border:'1px solid rgba(34,197,94,0.2)', color:'#4ade80',
+            }}>Resume</button>
+          )}
+        </div>
+      </div>
+
+      {/* Main content */}
+      <div style={{
+        position:'relative', zIndex:1, minHeight:'100vh',
+        display:'flex', flexDirection:'column',
+        alignItems:'center', justifyContent:'center',
+        padding:'88px 32px 32px', gap:'24px',
+      }}>
+        {/* 3-column row */}
+        <div style={{
+          display:'flex', alignItems:'center', justifyContent:'center',
+          gap:'32px', width:'100%', maxWidth:'940px',
+        }}>
+          {/* LEFT: Score */}
+          <div style={{ flex:'0 0 185px', display:'flex', flexDirection:'column', gap:'12px' }}>
+            <div className="glass stat-card" style={{ borderRadius:'18px', padding:'24px 18px', textAlign:'center' }}>
+              <div style={{ fontSize:'10px', color:'rgba(255,255,255,0.28)', letterSpacing:'0.12em', marginBottom:'10px' }}>POSTURE SCORE</div>
+              <div className="score-num" style={{
+                fontSize:'68px', fontWeight:'800', lineHeight:1, color:col, transition:'color 0.5s',
+              }}>{score}</div>
+              <div style={{
+                marginTop:'12px', padding:'4px 14px', borderRadius:'100px', display:'inline-block',
+                background:`rgba(${rgb},0.12)`, border:`1px solid rgba(${rgb},0.3)`,
+                fontSize:'11px', fontWeight:'700', color:col, letterSpacing:'0.07em',
+                textTransform:'uppercase', transition:'all 0.5s',
+              }}>{pState}</div>
+            </div>
+            {/* Scale reference */}
+            <div className="glass stat-card" style={{ borderRadius:'14px', padding:'14px 16px' }}>
+              <div style={{ fontSize:'9px', color:'rgba(255,255,255,0.24)', marginBottom:'10px', letterSpacing:'0.1em' }}>SCORE SCALE</div>
+              {[
+                { label:'Good',     range:'75–100', c:'#22c55e' },
+                { label:'Drifting', range:'50–74',  c:'#f59e0b' },
+                { label:'Slouch',   range:'0–49',   c:'#ef4444' },
+              ].map(({ label, range, c }, i, arr) => (
+                <div key={label} style={{
+                  display:'flex', justifyContent:'space-between', alignItems:'center',
+                  padding:'5px 0', fontSize:'12px',
+                  borderBottom: i < arr.length-1 ? '1px solid rgba(255,255,255,0.04)' : 'none',
+                }}>
+                  <span style={{ color:c, fontWeight:'600' }}>{label}</span>
+                  <span style={{ color:'rgba(255,255,255,0.24)', fontSize:'11px' }}>{range}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* CENTER: Skeleton circle */}
+          <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', position:'relative' }}>
+            {/* Outer orbit ring */}
+            <div style={{
+              position:'absolute',
+              width:'358px', height:'358px', borderRadius:'50%',
+              border:`1px solid rgba(${rgb},0.12)`,
+              animation:'spinSlow 22s linear infinite',
+              pointerEvents:'none',
+            }}>
+              <div style={{
+                position:'absolute', top:'-4px', left:'50%', transform:'translateX(-50%)',
+                width:'8px', height:'8px', borderRadius:'50%',
+                background:col, boxShadow:`0 0 10px ${col}, 0 0 20px ${col}66`,
+              }}/>
+            </div>
+            {/* Second ring (counter) */}
+            <div style={{
+              position:'absolute',
+              width:'330px', height:'330px', borderRadius:'50%',
+              border:`1px solid rgba(${rgb},0.07)`,
+              animation:'spinSlow 18s linear infinite reverse',
+              pointerEvents:'none',
+            }}/>
+
+            {/* Skeleton circle container */}
+            <div style={{
+              width:'300px', height:'300px', borderRadius:'50%',
+              border:`2px solid rgba(${rgb},0.48)`,
+              background:'rgba(6,6,14,0.95)',
+              overflow:'hidden', position:'relative',
+              transition:'border-color 0.6s, box-shadow 0.6s',
+              boxShadow:`0 0 60px rgba(${rgb},0.18), 0 0 120px rgba(${rgb},0.06), inset 0 0 50px rgba(0,0,0,0.6)`,
+            }}>
+              <canvas
+                ref={hudCanvasRef}
+                width={300} height={300}
+                style={{ width:'100%', height:'100%', display:'block' }}
+              />
+              {phase === 'paused' && (
+                <div style={{
+                  position:'absolute', inset:0,
+                  background:'rgba(0,0,0,0.65)',
+                  display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:'8px',
+                }}>
+                  <div style={{ fontSize:'30px' }}>⏸</div>
+                  <div style={{ fontSize:'12px', color:'rgba(255,255,255,0.4)' }}>Monitoring Paused</div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* RIGHT: Stats */}
+          <div style={{ flex:'0 0 185px', display:'flex', flexDirection:'column', gap:'12px' }}>
+            {[
+              { label:'SESSION TIME', value:timeStr, icon:'⏱', sub:'active' },
+              { label:'AVG SCORE',    value:avgScore, icon:'📊', sub:'this session' },
+              { label:'ALERTS',       value:alertCount, icon:'⚡', sub:'slouch alerts' },
+            ].map(({ label, value, icon, sub }) => (
+              <div key={label} className="glass stat-card" style={{ borderRadius:'14px', padding:'16px 18px' }}>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px' }}>
+                  <div style={{ fontSize:'10px', color:'rgba(255,255,255,0.28)', letterSpacing:'0.1em' }}>{label}</div>
+                  <span style={{ fontSize:'14px' }}>{icon}</span>
+                </div>
+                <div className="score-num" style={{ fontSize:'30px', fontWeight:'800', color:'rgba(255,255,255,0.92)', lineHeight:1 }}>{value}</div>
+                <div style={{ fontSize:'10px', color:'rgba(255,255,255,0.22)', marginTop:'4px' }}>{sub}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Bottom: Sparkline */}
+        <div style={{ width:'100%', maxWidth:'940px' }}>
+          <div className="glass" style={{ borderRadius:'18px', padding:'18px 24px' }}>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'12px' }}>
+              <div style={{ fontSize:'10px', color:'rgba(255,255,255,0.28)', letterSpacing:'0.12em' }}>SESSION HISTORY</div>
+              <div style={{ fontSize:'11px', color:'rgba(255,255,255,0.2)' }}>{sessionLog.length} samples · every 5s</div>
+            </div>
+            <SparklineChart data={sessionLog} height={62}/>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── App ────────────────────────────────────────────────────────────
+function App() {
+  const [phase,           setPhase]           = useState('landing');
+  const [countdown,       setCountdown]       = useState(5);
+  const [calibSampleCount,setCalibSampleCount]= useState(0);
+  const [score,           setScore]           = useState(100);
+  const [pState,          setPState]          = useState('good');
+  const [notification,    setNotification]    = useState(null);
+  const [sessionLog,      setSessionLog]      = useState([]);
+  const [sessionSecs,     setSessionSecs]     = useState(0);
+  const [alertCount,      setAlertCount]      = useState(0);
+  const [avgScore,        setAvgScore]        = useState(100);
+  const [camActive,       setCamActive]       = useState(false);
+  const [permErr,         setPermErr]         = useState(null);
+  const [mpReady,         setMpReady]         = useState(false);
+  const [notifPermission, setNotifPermission] = useState(
+    'Notification' in window ? Notification.permission : 'denied'
+  );
+
+  const videoRef        = useRef(null);
+  const calibCanvasRef  = useRef(null);
+  const hudCanvasRef    = useRef(null);
+  const poseRef         = useRef(null);
+  const cameraRef       = useRef(null);
+  const baselineRef     = useRef(null);
+  const calibSamplesRef = useRef([]);
+  const slouchMsRef     = useRef(0);
+  const forgiveTimRef   = useRef(null);
+  const notifActiveRef  = useRef(false);
+  const notifExitTRef   = useRef(null);
+  const lastFrameTRef   = useRef(null);
+  const lastLogTRef     = useRef(0);
+  const sessionStartRef = useRef(null);
+  const scoreRef        = useRef(100);
+  const phaseRef        = useRef('landing');
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
+
+  // MediaPipe load check
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (window.Pose && window.Camera) { setMpReady(true); clearInterval(iv); }
+    }, 200);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Session clock
+  useEffect(() => {
+    if (phase !== 'monitoring') return;
+    const iv = setInterval(() =>
+      setSessionSecs(Math.floor((Date.now() - sessionStartRef.current) / 1000)), 1000);
+    return () => clearInterval(iv);
+  }, [phase]);
+
+  // ── Pose results ────────────────────────────────────────────────
+  const onPoseResults = useCallback((results) => {
+    const lm = results.poseLandmarks;
+    const ph = phaseRef.current;
+
+    if (ph === 'calibrating') {
+      const c = calibCanvasRef.current;
+      if (c) drawSkeleton(c, lm, 'good');
+      if (lm) {
+        const nose = lm[LM.NOSE], ls = lm[LM.L_SHOULDER], rs = lm[LM.R_SHOULDER];
+        if (nose && ls && rs &&
+            nose.visibility > 0.58 && ls.visibility > 0.58 && rs.visibility > 0.58) {
+          calibSamplesRef.current.push({
+            shoulderLevelness:   Math.abs(ls.y - rs.y),
+            noseToShoulderRatio: (ls.y + rs.y) / 2 - nose.y,
+            avgShoulderY:        (ls.y + rs.y) / 2,
+          });
+          setCalibSampleCount(calibSamplesRef.current.length);
+        }
+      }
+      return;
+    }
+
+    if (ph !== 'monitoring') return;
+
+    const hc = hudCanvasRef.current;
+    if (hc) drawSkeleton(hc, lm, getStateFromScore(scoreRef.current));
+
+    if (!lm || !baselineRef.current) return;
+
+    const newScore = computePostureScore(lm, baselineRef.current);
+    scoreRef.current = newScore;
+    setScore(newScore);
+    const newSt = getStateFromScore(newScore);
+    setPState(newSt);
+
+    const now = Date.now();
+    if (now - lastLogTRef.current >= 5000) {
+      lastLogTRef.current = now;
+      setSessionLog(prev => {
+        const next = [...prev, { time: now, score: newScore }];
+        setAvgScore(Math.round(next.reduce((s,d) => s+d.score, 0) / next.length));
+        return next;
+      });
+    }
+
+    if (!lastFrameTRef.current) lastFrameTRef.current = now;
+    const dt = Math.min(now - lastFrameTRef.current, 200);
+    lastFrameTRef.current = now;
+
+    if (newSt === 'slouching') {
+      if (forgiveTimRef.current) { clearTimeout(forgiveTimRef.current); forgiveTimRef.current = null; }
+      slouchMsRef.current += dt;
+      if (slouchMsRef.current >= 15000 && !notifActiveRef.current) {
+        notifActiveRef.current = true;
+        const secs = Math.round(slouchMsRef.current / 1000);
+        setAlertCount(c => c + 1);
+        setNotification({ msg: `Straighten up — slouching for ${secs}s.`, exiting: false });
+        // Web Notification for background tabs
+        if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
+          new Notification('BackGainAI — Posture Alert 🔴', {
+            body: `You've been slouching for ${secs} seconds. Sit up straight!`,
+            tag: 'posture-alert',
+          });
+        }
+      }
+    } else {
+      if (notifActiveRef.current) {
+        notifActiveRef.current = false;
+        setNotification(prev => prev ? { ...prev, exiting: true } : null);
+        if (notifExitTRef.current) clearTimeout(notifExitTRef.current);
+        notifExitTRef.current = setTimeout(() => setNotification(null), 320);
+      }
+      if (slouchMsRef.current > 0 && !forgiveTimRef.current) {
+        forgiveTimRef.current = setTimeout(() => {
+          slouchMsRef.current = 0;
+          forgiveTimRef.current = null;
+        }, 5000);
+      }
+    }
+  }, []);
+
+  // ── MediaPipe init ───────────────────────────────────────────────
+  const initPose = useCallback(() => {
+    if (poseRef.current) return poseRef.current;
+    const pose = new window.Pose({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+    });
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      enableSegmentation: false,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    pose.onResults(onPoseResults);
+    poseRef.current = pose;
+    return pose;
+  }, [onPoseResults]);
+
+  // ── Camera start ─────────────────────────────────────────────────
+  const startCamera = useCallback(async (pose) => {
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      const cam = new window.Camera(video, {
+        onFrame: async () => {
+          const ph = phaseRef.current;
+          if (ph === 'calibrating' || ph === 'monitoring') await pose.send({ image: video });
+        },
+        width: 320, height: 240,
+      });
+      await cam.start();
+      cameraRef.current = cam;
+      setCamActive(true);
+      setPermErr(null);
+    } catch (err) {
+      setPermErr(err.message || 'Camera access denied. Please allow camera access and try again.');
+    }
+  }, []);
+
+  // ── Calibration ──────────────────────────────────────────────────
+  const runCalibration = useCallback(() => {
+    calibSamplesRef.current = [];
+    setCalibSampleCount(0);
+    setPhase('calibrating');
+    setCountdown(5);
+    let count = 5;
+    const timer = setInterval(() => {
+      count--;
+      setCountdown(count);
+      if (count <= 0) {
+        clearInterval(timer);
+        const samples = calibSamplesRef.current;
+        if (samples.length > 0) {
+          const avg = k => samples.reduce((s,d) => s+d[k], 0) / samples.length;
+          baselineRef.current = {
+            shoulderLevelness:   avg('shoulderLevelness'),
+            noseToShoulderRatio: avg('noseToShoulderRatio'),
+            avgShoulderY:        avg('avgShoulderY'),
+          };
+        }
+        sessionStartRef.current = Date.now();
+        lastLogTRef.current     = Date.now();
+        lastFrameTRef.current   = null;
+        slouchMsRef.current     = 0;
+        setPhase('monitoring');
+      }
+    }, 1000);
+  }, []);
+
+  // ── Handlers ─────────────────────────────────────────────────────
+  const handleStart = useCallback(async () => {
+    setPermErr(null);
+    const pose = initPose();
+    await startCamera(pose);
+    setTimeout(() => runCalibration(), 600); // warm-up delay
+  }, [initPose, startCamera, runCalibration]);
+
+  const handlePause = useCallback(() => {
+    if (cameraRef.current?.stop) cameraRef.current.stop();
+    const video = videoRef.current;
+    if (video?.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
+    setCamActive(false);
+    setPhase('paused');
+    notifActiveRef.current = false;
+    setNotification(null);
+  }, []);
+
+  const handleResume = useCallback(async () => {
+    const pose = initPose();
+    await startCamera(pose);
+    setTimeout(() => runCalibration(), 600);
+  }, [initPose, startCamera, runCalibration]);
+
+  const handleRecalibrate = useCallback(() => {
+    slouchMsRef.current = 0;
+    notifActiveRef.current = false;
+    setNotification(null);
+    runCalibration();
+  }, [runCalibration]);
+
+  const handleRequestNotif = useCallback(async () => {
+    if (!('Notification' in window)) return;
+    const perm = await Notification.requestPermission();
+    setNotifPermission(perm);
+    if (perm === 'granted') {
+      new Notification('BackGainAI — Alerts Enabled ✓', {
+        body: "You'll be notified when slouching is detected, even when the tab is in the background.",
+        tag: 'notif-test',
+      });
+    }
+  }, []);
+
+  const isActive = phase === 'monitoring' || phase === 'paused';
+
+  return (
+    <div>
+      <video ref={videoRef} style={{ display:'none' }} playsInline muted/>
+
+      {phase === 'landing' && (
+        <LandingPage onContinue={() => setPhase('disclaimers')} mpReady={mpReady}/>
+      )}
+      {phase === 'disclaimers' && (
+        <DisclaimerPage onContinue={() => setPhase('init')}/>
+      )}
+      {(phase === 'init' || phase === 'calibrating') && (
+        <CalibrationModal
+          phase={phase}
+          countdown={countdown}
+          calibSampleCount={calibSampleCount}
+          permErr={permErr}
+          mpReady={mpReady}
+          onStart={handleStart}
+          calibCanvasRef={calibCanvasRef}
+        />
+      )}
+      {isActive && (
+        <MonitoringView
+          phase={phase}
+          score={score}
+          pState={pState}
+          sessionLog={sessionLog}
+          sessionSecs={sessionSecs}
+          avgScore={avgScore}
+          alertCount={alertCount}
+          camActive={camActive}
+          hudCanvasRef={hudCanvasRef}
+          onPause={handlePause}
+          onResume={handleResume}
+          onRecalibrate={handleRecalibrate}
+          notifPermission={notifPermission}
+          onRequestNotif={handleRequestNotif}
+        />
+      )}
+
+      {/* Notification toast */}
+      {notification && isActive && (
+        <div
+          className={notification.exiting ? 'notif-exit' : 'notif-enter'}
+          style={{
+            position:'fixed', right:'24px', top:'72px', zIndex:2000,
+            background:'rgba(239,68,68,0.1)',
+            backdropFilter:'blur(22px)', WebkitBackdropFilter:'blur(22px)',
+            border:'1px solid rgba(239,68,68,0.3)',
+            borderRadius:'100px', padding:'13px 24px',
+            display:'flex', alignItems:'center', gap:'11px',
+            boxShadow:'0 4px 36px rgba(239,68,68,0.22)',
+            maxWidth:'370px',
+          }}
+        >
+          <div style={{
+            width:'8px', height:'8px', borderRadius:'50%',
+            background:'#ef4444', flexShrink:0, animation:'pulse 1.5s infinite',
+          }}/>
+          <span style={{ fontSize:'13px', color:'rgba(255,255,255,0.9)', fontWeight:'500', lineHeight:1.35 }}>
+            {notification.msg}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+
+</script>
+</body>
+</html>
