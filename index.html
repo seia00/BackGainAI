@@ -1040,6 +1040,7 @@ function App() {
     if (newSt === 'slouching') {
       if (forgiveTimRef.current) { clearTimeout(forgiveTimRef.current); forgiveTimRef.current = null; }
       slouchMsRef.current += dt;
+      if (slouchMsRef.current % 2000 < dt) console.log('[BackGainAI] slouching for', Math.round(slouchMsRef.current / 1000) + 's');
       if (slouchMsRef.current >= 15000 && !notifActiveRef.current) {
         notifActiveRef.current = true;
         triggerSlouchAlert(Math.round(slouchMsRef.current / 1000));
@@ -1161,6 +1162,7 @@ function App() {
   }, [runCalibration]);
 
   const triggerSlouchAlert = useCallback((secs) => {
+    console.log('[BackGainAI] triggerSlouchAlert called, secs:', secs, 'document.hidden:', document.hidden, 'permission:', 'Notification' in window ? Notification.permission : 'unsupported');
     setAlertCount(c => c + 1);
     if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
       new Notification('BackGainAI — Posture Alert 🔴', {
@@ -1170,6 +1172,23 @@ function App() {
     } else {
       setNotification({ msg: `Straighten up — slouching for ${secs}s.`, exiting: false });
     }
+  }, []);
+
+  // Fire OS notification when tab hides while slouch alert is already active
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      console.log('[BackGainAI] visibilitychange, hidden:', document.hidden, 'slouchMs:', slouchMsRef.current, 'notifActive:', notifActiveRef.current);
+      if (document.hidden && notifActiveRef.current &&
+          'Notification' in window && Notification.permission === 'granted') {
+        const secs = Math.round(slouchMsRef.current / 1000);
+        new Notification('BackGainAI — Posture Alert 🔴', {
+          body: `You've been slouching for ${secs} seconds. Sit up straight!`,
+          tag: 'posture-alert',
+        });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   }, []);
 
   const handleRequestNotif = useCallback(async () => {
