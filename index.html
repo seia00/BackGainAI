@@ -964,6 +964,13 @@ function App() {
   const phaseRef        = useRef('landing');
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
+  // Request notification permission on app load
+  useEffect(() => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().then(perm => setNotifPermission(perm));
+    }
+  }, []);
+
   // MediaPipe load check
   useEffect(() => {
     const iv = setInterval(() => {
@@ -1035,16 +1042,7 @@ function App() {
       slouchMsRef.current += dt;
       if (slouchMsRef.current >= 15000 && !notifActiveRef.current) {
         notifActiveRef.current = true;
-        const secs = Math.round(slouchMsRef.current / 1000);
-        setAlertCount(c => c + 1);
-        setNotification({ msg: `Straighten up — slouching for ${secs}s.`, exiting: false });
-        // Web Notification for background tabs
-        if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
-          new Notification('BackGainAI — Posture Alert 🔴', {
-            body: `You've been slouching for ${secs} seconds. Sit up straight!`,
-            tag: 'posture-alert',
-          });
-        }
+        triggerSlouchAlert(Math.round(slouchMsRef.current / 1000));
       }
     } else {
       if (notifActiveRef.current) {
@@ -1161,6 +1159,18 @@ function App() {
     setNotification(null);
     runCalibration();
   }, [runCalibration]);
+
+  const triggerSlouchAlert = useCallback((secs) => {
+    setAlertCount(c => c + 1);
+    if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+      new Notification('BackGainAI — Posture Alert 🔴', {
+        body: `You've been slouching for ${secs} seconds. Sit up straight!`,
+        tag: 'posture-alert',
+      });
+    } else {
+      setNotification({ msg: `Straighten up — slouching for ${secs}s.`, exiting: false });
+    }
+  }, []);
 
   const handleRequestNotif = useCallback(async () => {
     if (!('Notification' in window)) return;
